@@ -26,7 +26,11 @@ func ExpandReference(sizeClass int, packed *gc.ObjMask, unpacked *gc.PtrMask) {
 	f := size / goarch.PtrSize
 	for i := range nObj {
 		// Check if the object is marked.
-		if packed[i/goarch.PtrBits]&(uintptr(1)<<(i%goarch.PtrBits)) == 0 {
+		bitIdx := i
+		if gc.MarkBitsAreSparse {
+			bitIdx *= size / gc.MarkBitsSparseDistance
+		}
+		if packed[bitIdx/goarch.PtrBits]&(uintptr(1)<<(bitIdx%goarch.PtrBits)) == 0 {
 			continue
 		}
 		// Propagate that mark into the destination into one bit per the

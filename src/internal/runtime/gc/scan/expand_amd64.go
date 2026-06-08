@@ -14,6 +14,9 @@ import "internal/runtime/gc"
 //go:noescape
 func ExpandAVX512(sizeClass int, packed *gc.ObjMask, unpacked *gc.PtrMask)
 
+//go:noescape
+func ExpandSparseAVX512(elemsize int, packed *gc.ObjMask, unpacked *gc.PtrMask)
+
 // gcExpandersAVX512 is the PCs of expander functions. These cannot be called directly
 // as they don't follow the Go ABI, but you can use this to check if a given
 // expander PC is 0.

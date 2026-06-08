@@ -23,6 +23,9 @@ func ScanSpanPackedReference(mem unsafe.Pointer, bufp *uintptr, objMarks *gc.Obj
 	expandBy := uintptr(gc.SizeClassToSize[sizeClass]) / goarch.PtrSize
 	for word := range gc.PageWords {
 		objI := uintptr(word) / expandBy
+		if gc.MarkBitsAreSparse {
+			objI *= uintptr(gc.SizeClassToSize[sizeClass]) / gc.MarkBitsSparseDistance
+		}
 		if objMarks[objI/goarch.PtrBits]&(1<<(objI%goarch.PtrBits)) == 0 {
 			continue
 		}

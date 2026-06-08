@@ -8,6 +8,7 @@ package scan_test
 
 import (
 	"internal/runtime/gc/scan"
+	"internal/runtime/gc"
 	"testing"
 )
 
@@ -15,5 +16,9 @@ func TestExpandAVX512(t *testing.T) {
 	if !scan.CanAVX512() {
 		t.Skip("no AVX512")
 	}
-	testExpand(t, scan.ExpandAVX512)
+	if gc.MarkBitsAreSparse {
+		testExpand(t, scan.ExpandSparseAVX512)
+	} else {
+		testExpand(t, scan.ExpandAVX512)
+	}
 }

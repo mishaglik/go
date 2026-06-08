@@ -62,14 +62,25 @@ func testObjs(t *testing.T, f func(t *testing.T, sizeClass int, objMask *gc.ObjM
 		if size > gc.MinSizeForMallocHeader {
 			break // Pointer/scalar metadata is not packed for larger sizes.
 		}
+		if gc.MarkBitsAreSparse && size % gc.MarkBitsSparseDistance != 0 {
+			continue
+		}
 		t.Run(fmt.Sprintf("size=%d", size), func(t *testing.T) {
 			// Scan a few objects near i to test boundary conditions.
 			const objMask = 0x101
 			nObj := uintptr(gc.SizeClassToNPages[sizeClass]) * gc.PageSize / size
-			for i := range nObj - uintptr(bits.Len(objMask)-1) {
+			for i := range nObj - uintptr(bits.Len(objMask)) {
 				t.Run(fmt.Sprintf("objs=0x%x<<%d", objMask, i), func(t *testing.T) {
 					var objs gc.ObjMask
-					objs[i/goarch.PtrBits] = objMask << (i % goarch.PtrBits)
+					if gc.MarkBitsAreSparse {
+						idx := i * size / gc.MarkBitsSparseDistance
+						objs[idx/goarch.PtrBits] = 1 << (idx % goarch.PtrBits)
+						idx = (i+2) * size / gc.MarkBitsSparseDistance
+						objs[idx/goarch.PtrBits] = 1 << (idx % goarch.PtrBits)
+
+					} else {
+						objs[i/goarch.PtrBits] = objMask << (i % goarch.PtrBits)
+					}
 					f(t, sizeClass, &objs)
 				})
 			}
@@ -118,6 +129,9 @@ func benchmarkScanSpanPackedAllSizeClasses(b *testing.B, nPages int) {
 		if size >= gc.MinSizeForMallocHeader {
 			break
 		}
+		if gc.MarkBitsAreSparse && uintptr(size) % gc.MarkBitsSparseDistance != 0 {
+			continue
+		}
 		b.Run(fmt.Sprintf("sizeclass=%d", sc), func(b *testing.B) {
 			benchmarkScanSpanPacked(b, nPages, sc)
 		})
@@ -162,7 +176,12 @@ func benchmarkScanSpanPacked(b *testing.B, nPages int, sizeClass int) {
 		nMarks := int(float64(len(markOrder))*frac + 0.5)
 		var objMarks gc.ObjMask
 		for _, mark := range markOrder[:nMarks] {
-			objMarks[mark/goarch.PtrBits] |= 1 << (mark % goarch.PtrBits)
+			if gc.MarkBitsAreSparse {
+				idx := uintptr(mark) * objBytes / gc.MarkBitsSparseDistance
+				objMarks[idx/goarch.PtrBits] |= 1 << (idx % goarch.PtrBits)
+			} else {
+				objMarks[mark/goarch.PtrBits] |= 1 << (mark % goarch.PtrBits)
+			}
 		}
 		greyClusters := 0
 		for page := range ptrs {

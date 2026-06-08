@@ -26,7 +26,12 @@ func ScanSpanPackedGo(mem unsafe.Pointer, bufp *uintptr, objMarks *gc.ObjMask, s
 			// objStartInSpan is the index of the word from mem where the
 			// object stats. objEndInSpan points to the next object, i.e.
 			// it's an exclusive upper bound.
-			objStartInSpan := objBytes * uintptr(objIndex) / goarch.PtrSize
+			var objStartInSpan uintptr
+			if gc.MarkBitsAreSparse {
+				objStartInSpan = gc.MarkBitsSparseDistance * uintptr(objIndex) / goarch.PtrSize
+		  } else {
+				objStartInSpan = objBytes * uintptr(objIndex) / goarch.PtrSize
+			}
 			objEndInSpan := objStartInSpan + objBytes/goarch.PtrSize
 
 			// TODO: Another way to do this would be to extract the pointer mask

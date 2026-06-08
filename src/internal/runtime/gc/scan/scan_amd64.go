@@ -28,11 +28,18 @@ func CanAVX512() bool {
 }
 
 func ScanSpanPackedAVX512(mem unsafe.Pointer, bufp *uintptr, objMarks *gc.ObjMask, sizeClass uintptr, ptrMask *gc.PtrMask) (count int32) {
-	return FilterNilAVX512(bufp, scanSpanPackedAVX512(mem, bufp, objMarks, sizeClass, ptrMask))
+	if gc.MarkBitsAreSparse {
+		return FilterNilAVX512(bufp, scanSpanPackedSparseAVX512(mem, bufp, objMarks, uintptr(gc.SizeClassToSize[sizeClass]) / gc.MarkBitsSparseDistance, ptrMask))
+	} else {
+		return FilterNilAVX512(bufp, scanSpanPackedAVX512(mem, bufp, objMarks, sizeClass, ptrMask))
+	}
 }
 
 //go:noescape
 func scanSpanPackedAVX512(mem unsafe.Pointer, bufp *uintptr, objMarks *gc.ObjMask, sizeClass uintptr, ptrMask *gc.PtrMask) (count int32)
+
+//go:noescape
+func scanSpanPackedSparseAVX512(mem unsafe.Pointer, bufp *uintptr, objMarks *gc.ObjMask, elemsize uintptr, ptrMask *gc.PtrMask) (count int32)
 
 var avx512ScanPackedReqsMet = cpu.X86.HasAVX512VL &&
 	cpu.X86.HasAVX512BW &&

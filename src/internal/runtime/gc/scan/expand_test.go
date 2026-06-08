@@ -19,7 +19,11 @@ func testExpand(t *testing.T, expF expandFunc) {
 	testObjs(t, func(t *testing.T, sizeClass int, objs *gc.ObjMask) {
 		var want, got gc.PtrMask
 		expR(sizeClass, objs, &want)
-		expF(sizeClass, objs, &got)
+		if gc.MarkBitsAreSparse {
+			expF(int(gc.SizeClassToSize[sizeClass]) / int(gc.MarkBitsSparseDistance), objs, &got)
+		} else {
+			expF(sizeClass, objs, &got)
+		}
 
 		for i := range want {
 			if got[i] != want[i] {
