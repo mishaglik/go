@@ -45,7 +45,7 @@ import (
 	"unsafe"
 )
 
-const doubleCheckGreenTea = false
+const doubleCheckGreenTea = true
 
 // spanInlineMarkBits are mark bits that are inlined into the span
 // itself. gcUsesSpanInlineMarkBits may be used to check if objects
@@ -190,6 +190,15 @@ func (s *mspan) initInlineMarkBits() {
 	s.inlineMarkBits().init(s.spanclass, s.needzero != 0)
 }
 
+//NOTE: This is reference implementation. It cat easily be rewritten with SIMD instructions 
+func collapseMarkBits(src *gc.ObjMask, dst *gc.ObjMask, elemsize uintptr, nelems uint16) {
+	for i := range nelems {
+		idx := i * uint16(elemsize / gc.MarkBitsSparseDistance)
+		bitm := src[idx/goarch.PtrBits] >> (idx%goarch.PtrBits)
+		dst[i/goarch.PtrBits] |= (bitm&1) << (i%goarch.PtrBits)
+	}
+}
+
 // moveInlineMarks merges the span's inline mark bits into dst and clears them.
 //
 // gcUsesSpanInlineMarkBits(s.elemsize) must be true.
@@ -200,13 +209,18 @@ func (s *mspan) moveInlineMarks(dst *gcBits) {
 	bytes := divRoundUp(uintptr(s.nelems), 8)
 	imb := s.inlineMarkBits()
 	imbMarks := (*gc.ObjMask)(unsafe.Pointer(&imb.marks))
-	for i := uintptr(0); i < bytes; i += goarch.PtrSize {
-		marks := bswapIfBigEndian(imbMarks[i/goarch.PtrSize])
-		if i/goarch.PtrSize == uintptr(len(imb.marks)+1)/goarch.PtrSize-1 {
-			marks &^= 0xff << ((goarch.PtrSize - 1) * 8) // mask out class
+	if gc.MarkBitsAreSparse {
+		collapseMarkBits(imbMarks, (*gc.ObjMask)(unsafe.Pointer(dst.bytep(0))), s.elemsize, s.nelems)
+	} else {
+		for i := uintptr(0); i < bytes; i += goarch.PtrSize {
+			marks := bswapIfBigEndian(imbMarks[i/goarch.PtrSize])
+			if i/goarch.PtrSize == uintptr(len(imb.marks)+1)/goarch.PtrSize-1 {
+				marks &^= 0xff << ((goarch.PtrSize - 1) * 8) // mask out class
+			}
+			*(*uintptr)(unsafe.Pointer(dst.bytep(i))) |= bswapIfBigEndian(marks)
 		}
-		*(*uintptr)(unsafe.Pointer(dst.bytep(i))) |= bswapIfBigEndian(marks)
 	}
+
 	if doubleCheckGreenTea && !s.spanclass.noscan() && imb.marks != imb.scans {
 		throw("marks don't match scans for span with pointer")
 	}
@@ -227,12 +241,21 @@ func (s *mspan) inlineMarkBits() *spanInlineMarkBits {
 
 func (s *mspan) markBitsForIndex(objIndex uintptr) (bits markBits) {
 	if gcUsesSpanInlineMarkBits(s.elemsize) {
-		bits.bytep = &s.inlineMarkBits().marks[objIndex/8]
+		if gc.MarkBitsAreSparse {
+			maskIdx := objIndex*s.elemsize/gc.MarkBitsSparseDistance
+			bits.bytep = &s.inlineMarkBits().marks[maskIdx/8]
+			bits.mask = uint8(1) << (maskIdx % 8)
+			bits.index = maskIdx
+		} else {
+			bits.bytep = &s.inlineMarkBits().marks[objIndex/8]
+			bits.mask = uint8(1) << (objIndex % 8)
+			bits.index = objIndex
+		}
 	} else {
 		bits.bytep = s.gcmarkBits.bytep(objIndex / 8)
+		bits.mask = uint8(1) << (objIndex % 8)
+		bits.index = objIndex
 	}
-	bits.mask = uint8(1) << (objIndex % 8)
-	bits.index = objIndex
 	return
 }
 
@@ -246,7 +269,11 @@ func (s *mspan) markBitsForBase() markBits {
 // scannedBitsForIndex returns a markBits representing the scanned bit
 // for objIndex in the inline mark bits.
 func (s *mspan) scannedBitsForIndex(objIndex uintptr) markBits {
-	return markBits{&s.inlineMarkBits().scans[objIndex/8], uint8(1) << (objIndex % 8), objIndex}
+	if gc.MarkBitsAreSparse {
+		return markBits{&s.inlineMarkBits().scans[objIndex*s.elemsize/gc.MarkBitsSparseDistance/8], uint8(1) << (objIndex*s.elemsize/gc.MarkBitsSparseDistance % 8), objIndex}
+	} else {
+		return markBits{&s.inlineMarkBits().scans[objIndex/8], uint8(1) << (objIndex % 8), objIndex}
+	}
 }
 
 // gcUsesSpanInlineMarkBits returns true if a span holding objects of a certain size
@@ -256,6 +283,9 @@ func (s *mspan) scannedBitsForIndex(objIndex uintptr) markBits {
 //
 //go:nosplit
 func gcUsesSpanInlineMarkBits(size uintptr) bool {
+	if gc.MarkBitsAreSparse && size % gc.MarkBitsSparseDistance != 0 {
+		return false
+	}
 	return heapBitsInSpan(size) && size >= 16
 }
 
@@ -283,11 +313,20 @@ func tryDeferToSpanScan(p uintptr, gcw *gcWork) bool {
 	objIndex := uint16((uint64(p-base) * uint64(gc.SizeClassToDivMagic[q.class.sizeclass()])) >> 32)
 
 	// Set mark bit.
-	idx, mask := objIndex/8, uint8(1)<<(objIndex%8)
-	if atomic.Load8(&q.marks[idx])&mask != 0 {
-		return true
+	if gc.MarkBitsAreSparse {
+		objSparseIndex := objIndex * gc.SizeClassToSize[q.class.sizeclass()] / uint16(gc.MarkBitsSparseDistance)
+		idx, mask := objSparseIndex/8, uint8(1)<<(objSparseIndex%8)
+		if atomic.Load8(&q.marks[idx])&mask != 0 {
+			return true
+		}
+		atomic.Or8(&q.marks[idx], mask)
+	} else {
+		idx, mask := objIndex/8, uint8(1)<<(objIndex%8)
+		if atomic.Load8(&q.marks[idx])&mask != 0 {
+			return true
+		}
+		atomic.Or8(&q.marks[idx], mask)
 	}
-	atomic.Or8(&q.marks[idx], mask)
 
 	// Fast-track noscan objects.
 	if q.class.noscan() {
@@ -855,6 +894,9 @@ func scanSpan(p objptr, gcw *gcWork) {
 		// Nobody else set any mark bits on this span while it was acquired.
 		// That means p is the sole object we need to handle. Fast-track it.
 		objIndex := p.objIndex()
+		if gc.MarkBitsAreSparse {
+			objIndex *= uint16(elemsize / gc.MarkBitsSparseDistance)
+		}
 		bytep := &imb.scans[objIndex/8]
 		mask := uint8(1) << (objIndex % 8)
 		if atomic.Load8(bytep)&mask != 0 {
@@ -865,7 +907,12 @@ func scanSpan(p objptr, gcw *gcWork) {
 		if debug.gctrace > 1 {
 			gcw.stats[spanclass.sizeclass()].sparseObjsScanned++
 		}
-		b := spanBase + uintptr(objIndex)*elemsize
+		var b uintptr
+		if gc.MarkBitsAreSparse {
+			b = spanBase + uintptr(objIndex)*gc.MarkBitsSparseDistance
+		} else {
+			b = spanBase + uintptr(objIndex)*elemsize
+		}
 		scanObjectSmall(spanBase, b, elemsize, gcw)
 		return
 	}
@@ -880,7 +927,12 @@ func scanSpan(p objptr, gcw *gcWork) {
 
 	// Grey objects and return if there's nothing else to do.
 	var toScan gc.ObjMask
-	objsMarked := spanSetScans(spanBase, nelems, imb, &toScan)
+	objsMarked := 0 
+	if gc.MarkBitsAreSparse {
+		objsMarked = spanSetSparseScans(spanBase, imb, &toScan)
+	} else {
+		objsMarked = spanSetScans(spanBase, nelems, imb, &toScan)
+	}
 	if objsMarked == 0 {
 		return
 	}
@@ -977,6 +1029,66 @@ func spanSetScans(spanBase uintptr, nelems uint16, imb *spanInlineMarkBits, toSc
 	return objsMarked
 }
 
+// spanSetSparseScans sets any unset mark bits that have their mark bits set in the inline mark bits.
+//
+// toScan is populated with bits indicating whether a particular mark bit was set.
+//
+// Returns the number of objects marked, which could be zero.
+func spanSetSparseScans(spanBase uintptr, imb *spanInlineMarkBits, toScan *gc.ObjMask) int {
+	arena, pageIdx, pageMask := pageIndexOf(spanBase)
+	if arena.pageMarks[pageIdx]&pageMask == 0 {
+		atomic.Or8(&arena.pageMarks[pageIdx], pageMask)
+	}
+	objsMarked := 0
+
+	// Careful: these two structures alias since ObjMask is much bigger
+	// than marks or scans. We do these unsafe shenanigans so that we can
+	// access the marks and scans by uintptrs rather than by byte.
+	imbMarks := (*gc.ObjMask)(unsafe.Pointer(&imb.marks))
+	imbScans := (*gc.ObjMask)(unsafe.Pointer(&imb.scans))
+	for i := uintptr(0); i < uintptr(len(imb.marks) - len(imb.marks)%goarch.PtrSize); i += goarch.PtrSize {
+		scans := atomic.Loaduintptr(&imbScans[i/goarch.PtrSize])
+		marks := imbMarks[i/goarch.PtrSize]
+		scans = bswapIfBigEndian(scans)
+		marks = bswapIfBigEndian(marks)
+
+		toGrey := marks &^ scans
+		toScan[i/goarch.PtrSize] = toGrey
+
+		// If there's anything left to grey, do it.
+		if toGrey != 0 {
+			toGrey = bswapIfBigEndian(toGrey)
+			if goarch.PtrSize == 4 {
+				atomic.Or32((*uint32)(unsafe.Pointer(&imbScans[i/goarch.PtrSize])), uint32(toGrey))
+			} else {
+				atomic.Or64((*uint64)(unsafe.Pointer(&imbScans[i/goarch.PtrSize])), uint64(toGrey))
+			}
+		}
+		objsMarked += sys.OnesCount64(uint64(toGrey))
+	}
+	scans := atomic.Loaduintptr(&imbScans[len(imb.scans)/goarch.PtrSize])
+	marks := imbMarks[len(imb.marks)/goarch.PtrSize]
+	scans = bswapIfBigEndian(scans)
+	marks = bswapIfBigEndian(marks)
+	scans &^= 0xff << ((goarch.PtrSize - 1) * 8) // mask out owned
+	marks &^= 0xff << ((goarch.PtrSize - 1) * 8) // mask out class
+
+	toGrey := marks &^ scans
+	toScan[len(imb.marks)/goarch.PtrSize] = toGrey
+
+	// If there's anything left to grey, do it.
+	if toGrey != 0 {
+		toGrey = bswapIfBigEndian(toGrey)
+		if goarch.PtrSize == 4 {
+			atomic.Or32((*uint32)(unsafe.Pointer(&imbScans[len(imb.scans)/goarch.PtrSize])), uint32(toGrey))
+		} else {
+			atomic.Or64((*uint64)(unsafe.Pointer(&imbScans[len(imb.scans)/goarch.PtrSize])), uint64(toGrey))
+		}
+	}
+	objsMarked += sys.OnesCount64(uint64(toGrey))
+	return objsMarked
+}
+
 func scanObjectSmall(spanBase, b, objSize uintptr, gcw *gcWork) {
 	hbitsBase, _ := spanHeapBitsRange(spanBase, gc.PageSize, objSize)
 	hbits := (*byte)(unsafe.Pointer(hbitsBase))
@@ -1015,7 +1127,7 @@ func scanObjectSmall(spanBase, b, objSize uintptr, gcw *gcWork) {
 func scanObjectsSmall(base, objSize uintptr, elems uint16, gcw *gcWork, scans *gc.ObjMask) {
 	nptrs := 0
 	for i, bits := range scans {
-		if i*(goarch.PtrSize*8) > int(elems) {
+		if i*(goarch.PtrSize*8) > int(elems) && !gc.MarkBitsAreSparse {
 			break
 		}
 		n := sys.OnesCount64(uint64(bits))
@@ -1025,7 +1137,12 @@ func scanObjectsSmall(base, objSize uintptr, elems uint16, gcw *gcWork, scans *g
 			j := sys.TrailingZeros64(uint64(bits))
 			bits &^= 1 << j
 
-			b := base + uintptr(i*(goarch.PtrSize*8)+j)*objSize
+			var b uintptr
+			if gc.MarkBitsAreSparse {
+				b = base + uintptr(i*(goarch.PtrSize*8)+j)*gc.MarkBitsSparseDistance
+			} else {
+				b = base + uintptr(i*(goarch.PtrSize*8)+j)*objSize
+			}
 			ptrBits := extractHeapBitsSmall(hbits, base, b, objSize)
 			gcw.heapScanWork += int64(sys.Len64(uint64(ptrBits)) * goarch.PtrSize)
 

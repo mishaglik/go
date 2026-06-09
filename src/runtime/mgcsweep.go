@@ -26,6 +26,7 @@ package runtime
 
 import (
 	"internal/runtime/atomic"
+	"internal/goexperiment"
 	"unsafe"
 )
 
@@ -566,6 +567,10 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 				if tmp.kind == _KindSpecialFinalizer {
 					// Stop freeing of object if it has a finalizer.
 					mbits.setMarkedNonAtomic()
+					if goexperiment.GreenTeaGC && gcUsesSpanInlineMarkBits(size) {
+						sbits := s.scannedBitsForIndex(objIndex)
+						sbits.setMarkedNonAtomic()
+					}
 					hasFinAndRevived = true
 					break
 				}

@@ -14,5 +14,5 @@ type ObjMask [MaxObjsPerSpan / (goarch.PtrSize * 8)]uintptr
 // PtrMask is a bitmap where each bit represents a pointer-word in a single runtime page.
 type PtrMask [PageSize / goarch.PtrSize / (goarch.PtrSize * 8)]uintptr
 
-const MarkBitsAreSparse bool = false
+const MarkBitsAreSparse bool = true
 const MarkBitsSparseDistance uintptr = 2 * goarch.PtrSize 
