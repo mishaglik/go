@@ -42,8 +42,8 @@ func testScanSpanPacked(t *testing.T, scanF scanFunc) {
 	bufF := make([]uintptr, gc.PageWords)
 	bufR := make([]uintptr, gc.PageWords)
 	testObjs(t, func(t *testing.T, sizeClass int, objs *gc.ObjMask) {
-		nF := scanF(unsafe.Pointer(&mem[0]), &bufF[0], objs, uintptr(sizeClass), &ptrs)
 		nR := scanR(unsafe.Pointer(&mem[0]), &bufR[0], objs, uintptr(sizeClass), &ptrs)
+		nF := scanF(unsafe.Pointer(&mem[0]), &bufF[0], objs, uintptr(sizeClass), &ptrs)
 
 		if nR != nF {
 			t.Errorf("want %d count, got %d", nR, nF)

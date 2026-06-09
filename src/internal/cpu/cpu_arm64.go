@@ -21,6 +21,7 @@ func doinit() {
 		{Name: "atomics", Feature: &ARM64.HasATOMICS},
 		{Name: "cpuid", Feature: &ARM64.HasCPUID},
 		{Name: "isNeoverse", Feature: &ARM64.IsNeoverse},
+		{Name: "sve", Feature: &ARM64.HasSVE},
 	}
 
 	// arm64 uses different ways to detect CPU features at runtime depending on the operating system.
