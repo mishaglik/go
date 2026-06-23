@@ -24,7 +24,6 @@ package runtime
 
 import (
 	"internal/goarch"
-	"internal/runtime/atomic"
 	"unsafe"
 )
 
@@ -202,21 +201,9 @@ func wbBufFlush1(pp *p) {
 	// while we're processing the buffer.
 	pp.wbBuf.next = 0
 
-	if useCheckmark {
-		// Slow path for checkmark mode.
-		for _, ptr := range ptrs {
-			shade(ptr)
-		}
-		pp.wbBuf.reset()
-		return
-	}
-
 	// Mark all of the pointers in the buffer and record only the
 	// pointers we greyed. We use the buffer itself to temporarily
 	// record greyed pointers.
-	//
-	// TODO: Should scanObject/scanblock just stuff pointers into
-	// the wbBuf? Then this would become the sole greying path.
 	//
 	// TODO: We could avoid shading any of the "new" pointers in
 	// the buffer if the stack has been shaded, or even avoid
@@ -225,49 +212,7 @@ func wbBufFlush1(pp *p) {
 	// could track whether any un-shaded goroutine has used the
 	// buffer, or just track globally whether there are any
 	// un-shaded stacks and flush after each stack scan.
-	gcw := &pp.gcw
-	pos := 0
-	for _, ptr := range ptrs {
-		if ptr < minLegalPointer {
-			// nil pointers are very common, especially
-			// for the "old" values. Filter out these and
-			// other "obvious" non-heap pointers ASAP.
-			//
-			// TODO: Should we filter out nils in the fast
-			// path to reduce the rate of flushes?
-			continue
-		}
-		if tryDeferToSpanScan(ptr, gcw) {
-			continue
-		}
-		obj, span, objIndex := findObject(ptr, 0, 0)
-		if obj == 0 {
-			continue
-		}
-		// TODO: Consider making two passes where the first
-		// just prefetches the mark bits.
-		mbits := span.markBitsForIndex(objIndex)
-		if mbits.isMarked() {
-			continue
-		}
-		mbits.setMarked()
-
-		// Mark span.
-		arena, pageIdx, pageMask := pageIndexOf(span.base())
-		if arena.pageMarks[pageIdx]&pageMask == 0 {
-			atomic.Or8(&arena.pageMarks[pageIdx], pageMask)
-		}
-
-		if span.spanclass.noscan() {
-			gcw.bytesMarked += uint64(span.elemsize)
-			continue
-		}
-		ptrs[pos] = obj
-		pos++
-	}
-
-	// Enqueue the greyed objects.
-	gcw.putObjBatch(ptrs[:pos])
+	gcEnqueueBatch(ptrs, 0, &pp.gcw)
 
 	pp.wbBuf.reset()
 }

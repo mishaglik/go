@@ -259,25 +259,9 @@ func gcUsesSpanInlineMarkBits(size uintptr) bool {
 	return heapBitsInSpan(size) && size >= 16
 }
 
-// tryDeferToSpanScan tries to queue p on the span it points to, if it
+// deferSpanScan queues p on the span it points to, if it
 // points to a small object span (gcUsesSpanQueue size).
-func tryDeferToSpanScan(p uintptr, gcw *gcWork) bool {
-	if useCheckmark {
-		return false
-	}
-
-	// Quickly to see if this is a span that has inline mark bits.
-	ha := heapArenaOf(p)
-	if ha == nil {
-		return false
-	}
-	pageIdx := ((p / pageSize) / 8) % uintptr(len(ha.pageInUse))
-	pageMask := byte(1 << ((p / pageSize) % 8))
-	if ha.pageUseSpanInlineMarkBits[pageIdx]&pageMask == 0 {
-		return false
-	}
-
-	// Find the object's index from the span class info stored in the inline mark bits.
+func deferSpanScan(p uintptr, gcw *gcWork) {
 	base := alignDown(p, gc.PageSize)
 	q := spanInlineMarkBitsFromBase(base)
 	objIndex := uint16((uint64(p-base) * uint64(gc.SizeClassToDivMagic[q.class.sizeclass()])) >> 32)
@@ -285,14 +269,14 @@ func tryDeferToSpanScan(p uintptr, gcw *gcWork) bool {
 	// Set mark bit.
 	idx, mask := objIndex/8, uint8(1)<<(objIndex%8)
 	if atomic.Load8(&q.marks[idx])&mask != 0 {
-		return true
+		return
 	}
 	atomic.Or8(&q.marks[idx], mask)
 
 	// Fast-track noscan objects.
 	if q.class.noscan() {
 		gcw.bytesMarked += uint64(gc.SizeClassToSize[q.class.sizeclass()])
-		return true
+		return
 	}
 
 	// Queue up the pointer (as a representative for its span).
@@ -310,7 +294,7 @@ func tryDeferToSpanScan(p uintptr, gcw *gcWork) bool {
 			gcw.flushedWork = true
 		}
 	}
-	return true
+	return
 }
 
 // tryGetSpanFast attempts to get an entire span to scan.
@@ -919,13 +903,7 @@ func scanSpan(p objptr, gcw *gcWork) {
 	}
 
 	// Process all the pointers we just got.
-	for _, p := range gcw.ptrBuf[:nptrs] {
-		if !tryDeferToSpanScan(p, gcw) {
-			if obj, span, objIndex := findObject(p, 0, 0); obj != 0 {
-				greyobject(obj, 0, 0, span, gcw, objIndex)
-			}
-		}
-	}
+	gcEnqueueBatch(gcw.ptrBuf[:nptrs], spanBase, gcw)
 }
 
 // spanSetScans sets any unset mark bits that have their mark bits set in the inline mark bits.
@@ -999,17 +977,7 @@ func scanObjectSmall(spanBase, b, objSize uintptr, gcw *gcWork) {
 	}
 
 	// Process all the pointers we just got.
-	for _, p := range gcw.ptrBuf[:nptrs] {
-		p = *(*uintptr)(unsafe.Pointer(p))
-		if p == 0 {
-			continue
-		}
-		if !tryDeferToSpanScan(p, gcw) {
-			if obj, span, objIndex := findObject(p, 0, 0); obj != 0 {
-				greyobject(obj, 0, 0, span, gcw, objIndex)
-			}
-		}
-	}
+	gcEnqueueBatchIndirect(gcw.ptrBuf[:nptrs], spanBase, gcw)
 }
 
 func scanObjectsSmall(base, objSize uintptr, elems uint16, gcw *gcWork, scans *gc.ObjMask) {
@@ -1047,17 +1015,7 @@ func scanObjectsSmall(base, objSize uintptr, elems uint16, gcw *gcWork, scans *g
 	}
 
 	// Process all the pointers we just got.
-	for _, p := range gcw.ptrBuf[:nptrs] {
-		p = *(*uintptr)(unsafe.Pointer(p))
-		if p == 0 {
-			continue
-		}
-		if !tryDeferToSpanScan(p, gcw) {
-			if obj, span, objIndex := findObject(p, 0, 0); obj != 0 {
-				greyobject(obj, 0, 0, span, gcw, objIndex)
-			}
-		}
-	}
+	gcEnqueueBatchIndirect(gcw.ptrBuf[:nptrs], base, gcw)
 }
 
 func extractHeapBitsSmall(hbits *byte, spanBase, addr, elemsize uintptr) uintptr {
@@ -1265,16 +1223,167 @@ func scanObject(b uintptr, gcw *gcWork) {
 			// heap. In this case, we know the object was
 			// just allocated and hence will be marked by
 			// allocation itself.
-			if !tryDeferToSpanScan(obj, gcw) {
-				if obj, span, objIndex := findObject(obj, b, addr-b); obj != 0 {
-					greyobject(obj, b, addr-b, span, gcw, objIndex)
-				}
-			}
+			gcEnqueue(obj, b, addr, gcw)
 		}
 	}
 	gcw.bytesMarked += uint64(n)
 	gcw.heapScanWork += int64(scanSize)
 	if debug.gctrace > 1 {
 		gcw.stats[s.spanclass.sizeclass()].sparseObjsScanned++
+	}
+}
+
+// gcEnqueue is main entry point of putting object to garbage collection
+// as both GreenTea GC and regular GC evaluete heapArenaOf for pointer
+// this implementation manually inlines findObject and spanOf to avoid
+// reevaluation of heapArenaOf
+//
+//go:nowritebarrier
+func gcEnqueue(p uintptr, base, addr uintptr, gcw *gcWork) {
+	// Quickly to see if this is a span that has inline mark bits.
+	ha := heapArenaOf(p)
+	if ha == nil {
+		return
+	}
+	pageIdx := ((p / pageSize) / 8) % uintptr(len(ha.pageInUse))
+	pageMask := byte(1 << ((p / pageSize) % 8))
+	if !useCheckmark && ha.pageUseSpanInlineMarkBits[pageIdx]&pageMask != 0 {
+		// GreenTea GC entry
+		deferSpanScan(p, gcw)
+		return
+	}
+
+	span := ha.spans[(p/pageSize)%pagesPerArena]
+	// If span is nil, the virtual address has never been part of the heap.
+	// This pointer may be to some mmap'd region, so we allow it.
+	if span == nil {
+		if (GOARCH == "amd64" || GOARCH == "arm64") && p == clobberdeadPtr && debug.invalidptr != 0 {
+			// Crash if clobberdeadPtr is seen. Only on AMD64 and ARM64 for now,
+			// as they are the only platform where compiler's clobberdead mode is
+			// implemented. On these platforms clobberdeadPtr cannot be a valid address.
+			badPointer(span, p, base, addr-base)
+		}
+		return
+	}
+	// If p is a bad pointer, it may not be in s's bounds.
+	//
+	// Check s.state to synchronize with span initialization
+	// before checking other fields. See also spanOfHeap.
+	if state := span.state.get(); state != mSpanInUse || p < span.base() || p >= span.limit {
+		// Pointers into stacks are also ok, the runtime manages these explicitly.
+		if state == mSpanManual {
+			return
+		}
+		// The following ensures that we are rigorous about what data
+		// structures hold valid pointers.
+		if debug.invalidptr != 0 {
+			badPointer(span, p, base, addr-base)
+		}
+		return
+	}
+
+	objIndex := span.objIndex(p)
+	objBase := span.base() + objIndex*span.elemsize
+	greyobject(objBase, base, addr-base, span, gcw, objIndex)
+}
+
+//go:nowritebarrier
+func gcEnqueueBatch(objs []uintptr, base uintptr, gcw *gcWork) {
+	pos := 0
+	for _, p := range objs {
+		if p < minLegalPointer {
+			continue
+		}
+		// Quickly to see if this is a span that has inline mark bits.
+		ha := heapArenaOf(p)
+		if ha == nil {
+			continue
+		}
+		pageIdx := ((p / pageSize) / 8) % uintptr(len(ha.pageInUse))
+		pageMask := byte(1 << ((p / pageSize) % 8))
+		if !useCheckmark && ha.pageUseSpanInlineMarkBits[pageIdx]&pageMask != 0 {
+			// GreenTea GC entry
+			deferSpanScan(p, gcw)
+			continue
+		}
+
+		span := ha.spans[(p/pageSize)%pagesPerArena]
+		// If span is nil, the virtual address has never been part of the heap.
+		// This pointer may be to some mmap'd region, so we allow it.
+		if span == nil {
+			if (GOARCH == "amd64" || GOARCH == "arm64") && p == clobberdeadPtr && debug.invalidptr != 0 {
+				// Crash if clobberdeadPtr is seen. Only on AMD64 and ARM64 for now,
+				// as they are the only platform where compiler's clobberdead mode is
+				// implemented. On these platforms clobberdeadPtr cannot be a valid address.
+				badPointer(span, p, base, 0)
+			}
+			continue
+		}
+		// If p is a bad pointer, it may not be in s's bounds.
+		//
+		// Check s.state to synchronize with span initialization
+		// before checking other fields. See also spanOfHeap.
+		if state := span.state.get(); state != mSpanInUse || p < span.base() || p >= span.limit {
+			// Pointers into stacks are also ok, the runtime manages these explicitly.
+			if state == mSpanManual {
+				continue
+			}
+			// The following ensures that we are rigorous about what data
+			// structures hold valid pointers.
+			if debug.invalidptr != 0 {
+				badPointer(span, p, base, 0)
+			}
+			continue
+		}
+
+		objIndex := span.objIndex(p)
+		objBase := span.base() + objIndex*span.elemsize
+		mbits := span.markBitsForIndex(objIndex)
+		if useCheckmark {
+			if setCheckmark(objBase, base, 0, mbits) {
+				continue
+			}
+			if debug.checkfinalizers > 1 {
+				print("  mark ", hex(objBase), " found at *(", hex(base), "+ ???)\n")
+			}
+		} else {
+			if debug.gccheckmark > 0 && span.isFree(objIndex) {
+				print("runtime: marking free object ", hex(objBase), " found at *(", hex(base), "+ ???\n")
+				gcDumpObject("base", base, 0)
+				gcDumpObject("obj", objBase, ^uintptr(0))
+				getg().m.traceback = 2
+				throw("marking free object")
+			}
+		}
+		if mbits.isMarked() {
+			continue
+		}
+		mbits.setMarked()
+
+		if ha.pageMarks[pageIdx]&pageMask == 0 {
+			atomic.Or8(&ha.pageMarks[pageIdx], pageMask)
+		}
+
+		if span.spanclass.noscan() {
+			gcw.bytesMarked += uint64(span.elemsize)
+			continue
+		}
+		objs[pos] = objBase
+		pos++
+	}
+	if pos > 0 {
+		// Enqueue the greyed objects.
+		gcw.putObjBatch(objs[:pos])
+	}
+}
+
+//go:nowritebarrier
+func gcEnqueueBatchIndirect(slots []uintptr, base uintptr, gcw *gcWork) {
+	for _, slot := range slots {
+		obj := *(*uintptr)(unsafe.Pointer(slot))
+		if obj < minLegalPointer {
+			continue
+		}
+		gcEnqueue(obj, base, slot, gcw)
 	}
 }

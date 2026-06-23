@@ -8,6 +8,7 @@ package runtime
 
 import (
 	"internal/goarch"
+	"internal/runtime/atomic"
 	"internal/runtime/gc"
 	"internal/runtime/sys"
 	"unsafe"
@@ -20,10 +21,6 @@ func (s *mspan) markBitsForIndex(objIndex uintptr) markBits {
 
 func (s *mspan) markBitsForBase() markBits {
 	return markBits{&s.gcmarkBits.x, uint8(1), 0}
-}
-
-func tryDeferToSpanScan(p uintptr, gcw *gcWork) bool {
-	return false
 }
 
 func (s *mspan) initInlineMarkBits() {
@@ -46,15 +43,13 @@ func (s *mspan) scannedBitsForIndex(objIndex uintptr) markBits {
 	return markBits{}
 }
 
-type spanInlineMarkBits struct {
-}
+type spanInlineMarkBits struct{}
 
 func (q *spanInlineMarkBits) tryAcquire() bool {
 	return false
 }
 
-type spanQueue struct {
-}
+type spanQueue struct{}
 
 func (q *spanQueue) flush() {
 }
@@ -221,16 +216,115 @@ func scanObject(b uintptr, gcw *gcWork) {
 			// heap. In this case, we know the object was
 			// just allocated and hence will be marked by
 			// allocation itself.
-			if !tryDeferToSpanScan(obj, gcw) {
-				if obj, span, objIndex := findObject(obj, b, addr-b); obj != 0 {
-					greyobject(obj, b, addr-b, span, gcw, objIndex)
-				}
-			}
+			gcEnqueue(obj, b, addr, gcw)
 		}
 	}
 	gcw.bytesMarked += uint64(n)
 	gcw.heapScanWork += int64(scanSize)
 	if debug.gctrace > 1 {
 		gcw.stats[s.spanclass.sizeclass()].sparseObjsScanned++
+	}
+}
+
+//go:nowritebarrier
+func gcEnqueue(p uintptr, base, addr uintptr, gcw *gcWork) {
+	if obj, span, objIndex := findObject(p, base, addr-base); obj != 0 {
+		greyobject(obj, base, addr-base, span, gcw, objIndex)
+	}
+}
+
+//go:nowritebarrier
+func gcEnqueueBatch(objs []uintptr, base uintptr, gcw *gcWork) {
+	pos := 0
+	for _, p := range objs {
+		if p < minLegalPointer {
+			continue
+		}
+		// Quickly to see if this is a span that has inline mark bits.
+		ha := heapArenaOf(p)
+		if ha == nil {
+			continue
+		}
+		pageIdx := ((p / pageSize) / 8) % uintptr(len(ha.pageInUse))
+		pageMask := byte(1 << ((p / pageSize) % 8))
+
+		span := ha.spans[(p/pageSize)%pagesPerArena]
+		// If span is nil, the virtual address has never been part of the heap.
+		// This pointer may be to some mmap'd region, so we allow it.
+		if span == nil {
+			if (GOARCH == "amd64" || GOARCH == "arm64") && p == clobberdeadPtr && debug.invalidptr != 0 {
+				// Crash if clobberdeadPtr is seen. Only on AMD64 and ARM64 for now,
+				// as they are the only platform where compiler's clobberdead mode is
+				// implemented. On these platforms clobberdeadPtr cannot be a valid address.
+				badPointer(span, p, base, 0)
+			}
+			continue
+		}
+		// If p is a bad pointer, it may not be in s's bounds.
+		//
+		// Check s.state to synchronize with span initialization
+		// before checking other fields. See also spanOfHeap.
+		if state := span.state.get(); state != mSpanInUse || p < span.base() || p >= span.limit {
+			// Pointers into stacks are also ok, the runtime manages these explicitly.
+			if state == mSpanManual {
+				continue
+			}
+			// The following ensures that we are rigorous about what data
+			// structures hold valid pointers.
+			if debug.invalidptr != 0 {
+				badPointer(span, p, base, 0)
+			}
+			continue
+		}
+
+		objIndex := span.objIndex(p)
+		objBase := span.base() + objIndex*span.elemsize
+		mbits := span.markBitsForIndex(objIndex)
+		if useCheckmark {
+			if setCheckmark(objBase, base, 0, mbits) {
+				continue
+			}
+			if debug.checkfinalizers > 1 {
+				print("  mark ", hex(objBase), " found at *(", hex(base), "+ ???)\n")
+			}
+		} else {
+			if debug.gccheckmark > 0 && span.isFree(objIndex) {
+				print("runtime: marking free object ", hex(objBase), " found at *(", hex(base), "+ ???\n")
+				gcDumpObject("base", base, 0)
+				gcDumpObject("obj", objBase, ^uintptr(0))
+				getg().m.traceback = 2
+				throw("marking free object")
+			}
+		}
+		if mbits.isMarked() {
+			continue
+		}
+		mbits.setMarked()
+
+		if ha.pageMarks[pageIdx]&pageMask == 0 {
+			atomic.Or8(&ha.pageMarks[pageIdx], pageMask)
+		}
+
+		if span.spanclass.noscan() {
+			gcw.bytesMarked += uint64(span.elemsize)
+			continue
+		}
+		objs[pos] = objBase
+		pos++
+	}
+	if pos > 0 {
+		// Enqueue the greyed objects.
+		gcw.putObjBatch(objs[:pos])
+	}
+}
+
+//go:nowritebarrier
+func gcEnqueueBatchIndirect(slots []uintptr, base uintptr, gcw *gcWork) {
+	for _, slot := range slots {
+		obj := *(*uintptr)(unsafe.Pointer(slot))
+		if obj < minLegalPointer {
+			continue
+		}
+		gcEnqueue(obj, base, slot, gcw)
 	}
 }

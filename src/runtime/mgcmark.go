@@ -1503,11 +1503,7 @@ func scanblock(b0, n0 uintptr, ptrmask *uint8, gcw *gcWork, stk *stackScanState)
 					if stk != nil && p >= stk.stack.lo && p < stk.stack.hi {
 						stk.putPtr(p, false)
 					} else {
-						if !tryDeferToSpanScan(p, gcw) {
-							if obj, span, objIndex := findObject(p, b, i); obj != 0 {
-								greyobject(obj, b, i, span, gcw, objIndex)
-							}
-						}
+						gcEnqueue(p, b, b+i, gcw)
 					}
 				}
 			}
@@ -1614,9 +1610,7 @@ func scanConservative(b, n uintptr, ptrmask *uint8, gcw *gcWork, state *stackSca
 
 		// val points to an allocated object. Mark it.
 		obj := span.base() + idx*span.elemsize
-		if !tryDeferToSpanScan(obj, gcw) {
-			greyobject(obj, b, i, span, gcw, idx)
-		}
+		gcEnqueue(obj, b, b+i, gcw)
 	}
 }
 
@@ -1627,11 +1621,7 @@ func scanConservative(b, n uintptr, ptrmask *uint8, gcw *gcWork, state *stackSca
 //go:nowritebarrier
 func shade(b uintptr) {
 	gcw := &getg().m.p.ptr().gcw
-	if !tryDeferToSpanScan(b, gcw) {
-		if obj, span, objIndex := findObject(b, 0, 0); obj != 0 {
-			greyobject(obj, 0, 0, span, gcw, objIndex)
-		}
-	}
+	gcEnqueue(b, 0, 0, gcw)
 }
 
 // obj is the start of an object with mark mbits.
@@ -1789,9 +1779,6 @@ func gcMarkTinyAllocs() {
 			continue
 		}
 		gcw := &p.gcw
-		if !tryDeferToSpanScan(c.tiny, gcw) {
-			_, span, objIndex := findObject(c.tiny, 0, 0)
-			greyobject(c.tiny, 0, 0, span, gcw, objIndex)
-		}
+		gcEnqueue(c.tiny, 0, 0, gcw)
 	}
 }
