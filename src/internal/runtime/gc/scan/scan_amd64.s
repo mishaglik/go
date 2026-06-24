@@ -120,3 +120,79 @@ end:
 	MOVL DX, count+40(FP)
 	VZEROUPPER
 	RET
+
+
+TEXT ·scanObjectLargeAVX512(SB), NOSPLIT, $0-56
+	// SI = Current address in span
+	MOVQ mem+0(FP), SI
+	// DI = Scan buffer base
+	MOVQ bufp+8(FP), DI
+	// DX = Index in scan buffer, (DI)(DX*8) = Current position in scan buffer
+	MOVQ $0, DX
+ 
+  VPXORQ Z15, Z15, Z15
+
+loopArray:
+  // BX pointer to ptrsize
+  MOVQ ptrsize+16(FP), BX
+
+  // AX pointer to ptrmask 
+  MOVQ ptrmap+24(FP), AX
+
+	// Align loop to a cache line so that performance is less sensitive
+	// to how this function ends up laid out in memory. This is a hot
+	// function in the GC, and this is a tight loop. We don't want
+	// performance to waver wildly due to unrelated changes.
+	PCALIGN $64
+loopElement:
+	// CX = Fetch the mask of words to load from this frame.
+	MOVBQZX 0(AX), CX
+	// Skip empty frames.
+	TESTQ CX, CX
+	JZ skip
+
+	// Load the 64 byte frame.
+	KMOVB CX, K1
+	VMOVDQU64 0(SI), Z1
+
+	// Collect just the pointers from the greyed objects into the scan buffer,
+	// i.e., copy the word indices in the mask from Z1 into contiguous memory.
+	//
+	// N.B. VPCOMPRESSQ supports a memory destination. Unfortunately, on
+	// AMD Genoa / Zen 4, using VPCOMPRESSQ with a memory destination
+	// imposes a severe performance penalty of around an order of magnitude
+	// compared to a register destination.
+	//
+	// This workaround is unfortunate on other microarchitectures, where a
+	// memory destination is slightly faster than adding an additional move
+	// instruction, but no where near an order of magnitude. It would be
+	// nice to have a Genoa-only variant here.
+	//
+	// AMD Turin / Zen 5 fixes this issue.
+	//
+	// See
+	// https://lemire.me/blog/2025/02/14/avx-512-gotcha-avoid-compressing-words-to-memory-with-amd-zen-4-processors/.
+  VPCMPUQ $4, Z1, Z15, K1, K1 
+	KMOVW K1, CX
+	POPCNTL CX, CX
+	VPCOMPRESSQ Z1, K1, Z2
+	VMOVDQU64 Z2, (DI)(DX*8)
+
+	// Advance the scan buffer position by the number of pointers.
+	ADDQ CX, DX
+
+skip:
+	ADDQ $64, SI
+	ADDQ $1, AX
+  SUBQ $64, BX 
+	CMPQ BX, $0
+	JGT loopElement
+
+  ADDQ elemdiff+32(FP), SI
+  CMPQ limit+40(FP), SI
+  JGT  loopArray
+
+end: 
+	MOVQ DX, count+48(FP)
+	VZEROUPPER
+	RET

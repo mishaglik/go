@@ -1165,6 +1165,17 @@ func scanObject(b uintptr, gcw *gcWork) {
 		throw("scanObject of a noscan object")
 	}
 
+	if n >= 1024 && s.spanclass.sizeclass() != 0 && !useCheckmark {
+		if scanObjectLarge(b, s, n, gcw) {
+			gcw.bytesMarked += uint64(n)
+			gcw.heapScanWork += int64(n)
+			if debug.gctrace > 1 {
+				gcw.stats[s.spanclass.sizeclass()].sparseObjsScanned++
+			}
+			return
+		}
+	}
+
 	var tp typePointers
 	if n > maxObletBytes {
 		// Large object. Break into oblets for better

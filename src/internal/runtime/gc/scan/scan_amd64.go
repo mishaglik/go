@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build amd64
+
 package scan
 
 import (
@@ -21,6 +23,19 @@ func HasFastScanSpanPacked() bool {
 	return avx512ScanPackedReqsMet
 }
 
+const ScanLargeGranularity uintptr = 64
+
+func HasFastScanObjectLarge() bool {
+	return avx512ScanPackedReqsMet
+}
+
+func ScanObjectLarge(b unsafe.Pointer, dst *uintptr, ptrsize uintptr, ptrmap *uintptr, elemdiff uintptr, limit uintptr) uintptr {
+	if CanAVX512() {
+		return scanObjectLargeAVX512(b, dst, ptrsize, ptrmap, elemdiff, limit)
+	}
+	panic("not implemented")
+}
+
 // -- AVX512 --
 
 func CanAVX512() bool {
@@ -30,6 +45,9 @@ func CanAVX512() bool {
 func ScanSpanPackedAVX512(mem unsafe.Pointer, bufp *uintptr, objMarks *gc.ObjMask, sizeClass uintptr, ptrMask *gc.PtrMask) (count int32) {
 	return FilterNilAVX512(bufp, scanSpanPackedAVX512(mem, bufp, objMarks, sizeClass, ptrMask))
 }
+
+//go:noescape
+func scanObjectLargeAVX512(mem unsafe.Pointer, bufp *uintptr, ptrsize uintptr, ptrmap *uintptr, elemdiff uintptr, limit uintptr) (count uintptr)
 
 //go:noescape
 func scanSpanPackedAVX512(mem unsafe.Pointer, bufp *uintptr, objMarks *gc.ObjMask, sizeClass uintptr, ptrMask *gc.PtrMask) (count int32)

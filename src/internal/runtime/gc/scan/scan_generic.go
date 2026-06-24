@@ -18,6 +18,16 @@ func HasFastScanSpanPacked() bool {
 	return false
 }
 
+const ScanLargeGranularity uintptr = 512
+
+func HasFastScanObjectLarge() bool {
+	return false
+}
+
+func ScanObjectLarge(mem unsafe.Pointer, bufp *uintptr, ptrsize uintptr, ptrmap *uintptr, elemdiff uintptr, limit uintptr) uintptr {
+	panic("not implemented")
+}
+
 func ScanSpanPacked(mem unsafe.Pointer, bufp *uintptr, objMarks *gc.ObjMask, sizeClass uintptr, ptrMask *gc.PtrMask) (count int32) {
 	return ScanSpanPackedGo(mem, bufp, objMarks, sizeClass, ptrMask)
 }

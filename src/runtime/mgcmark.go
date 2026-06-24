@@ -11,6 +11,7 @@ import (
 	"internal/goarch"
 	"internal/goexperiment"
 	"internal/runtime/atomic"
+	"internal/runtime/gc/scan"
 	"internal/runtime/sys"
 	"unsafe"
 )
@@ -81,7 +82,7 @@ func allGsSnapshotSortedForGC() ([]*g, int) {
 	allgsSorted := make([]*g, len(allgs))
 
 	// Indices cutting off runnable and blocked Gs.
-	var currIndex, blockedIndex = 0, len(allgsSorted) - 1
+	currIndex, blockedIndex := 0, len(allgsSorted)-1
 	for _, gp := range allgs {
 		// not sure if we need atomic load because we are stopping the world,
 		// but do it just to be safe for now
@@ -1622,6 +1623,184 @@ func scanConservative(b, n uintptr, ptrmask *uint8, gcw *gcWork, state *stackSca
 func shade(b uintptr) {
 	gcw := &getg().m.p.ptr().gcw
 	gcEnqueue(b, 0, 0, gcw)
+}
+
+// prepareGCDataForScanLarge duplicates tp.typ.GCFata nelem times into buf
+func prepareGCDataForScanLarge(tp typePointers, nelem uintptr, buf *[gcPtrbufSize / goarch.PtrBits]uintptr) uintptr {
+	base := tp.addr
+	idx := uintptr(0)
+	off := uintptr(0)
+	// If bitmap is less that 64 bits clone it as much as possible to be under 64 bits
+	if tp.typ.Size_ < goarch.PtrBits*goarch.PtrSize {
+		mask := readUintptr(tp.typ.GCData)
+		sz := tp.typ.Size_ / goarch.PtrSize
+		step := sz
+		stepmask := mask
+		for 2*step <= goarch.PtrBits {
+			stepmask |= stepmask << step
+			step *= 2
+		}
+		for step+sz <= goarch.PtrBits {
+			stepmask |= mask << step
+			step += sz
+		}
+		finalIdx := tp.typ.Size_ * nelem / goarch.PtrSize / goarch.PtrBits
+		finalOff := tp.typ.Size_ * nelem / goarch.PtrSize % goarch.PtrBits
+		for idx < finalIdx {
+			if off == 0 {
+				buf[idx] |= stepmask
+			} else {
+				buf[idx] |= stepmask << off
+				if idx+1 < uintptr(len(buf)) {
+					buf[idx+1] |= stepmask >> (64 - off)
+				}
+			}
+			off += step
+			if off >= 64 {
+				off -= 64
+				idx++
+			}
+		}
+
+		if off > finalOff {
+			buf[idx] &= (1 << finalOff) - 1
+		}
+
+		for off < finalOff {
+			buf[idx] |= mask << off
+			off += sz
+		}
+		return tp.addr + tp.typ.Size_*nelem
+	}
+	buf[idx] = readUintptr(tp.typ.GCData)
+	for {
+		if tp.addr+goarch.PtrSize*goarch.PtrBits >= tp.elem+tp.typ.PtrBytes {
+			tp.elem += tp.typ.Size_
+			tp.addr = tp.elem
+			nelem--
+			if nelem == 0 {
+				return tp.addr
+			}
+			idx = (tp.addr - base) / goarch.PtrSize / goarch.PtrBits
+			off = (tp.addr - base) / goarch.PtrSize % goarch.PtrBits
+		} else {
+			tp.addr += ptrBits * goarch.PtrSize
+			idx++
+		}
+		tp.mask = readUintptr(addb(tp.typ.GCData, (tp.addr-tp.elem)/goarch.PtrBits))
+		if off == 0 {
+			buf[idx] |= tp.mask
+		} else {
+			buf[idx] |= tp.mask << off
+			if idx+1 < uintptr(len(buf)) {
+				buf[idx+1] |= tp.mask >> (64 - off)
+			}
+		}
+	}
+}
+
+func scanObjectLarge(b uintptr, s *mspan, n uintptr, gcw *gcWork) bool {
+	if !scan.HasFastScanObjectLarge() {
+		return false
+	}
+
+	tp := s.typePointersOfUnchecked(b)
+	// Adjust for allocheaders
+	if b != tp.addr {
+		n -= tp.addr - b
+		b = tp.addr
+	}
+
+	elemsize := tp.typ.Size_
+	ptrsize := tp.typ.PtrBytes
+
+	if elemsize == 0 || n < elemsize {
+		// Somathing unexpected, fallback to regular scan
+		return false
+	}
+
+	if ptrsize%goarch.PtrSize != 0 {
+		throw("Ptrsize is not multiple of pointer size")
+	}
+
+	ptrcnt := uintptr(0)
+	for i := range divRoundUp(tp.typ.PtrBytes, 64*8) {
+		ptrcnt += uintptr(sys.OnesCount64(uint64(readUintptr(addb(tp.typ.GCData, i*8)))))
+	}
+
+	if ptrcnt == 0 {
+		// No pointers in object.
+		return true
+	}
+
+	if 8*ptrcnt < tp.typ.Size_/3 {
+		// Heruisticically ignore too sparse objects.
+		return false
+	}
+
+	if ptrcnt > gcPtrbufSize {
+		// Too much pointers in one object.
+		// So they can't fit in ptrBuf
+		return false
+	}
+
+	gcdata := (*uintptr)(unsafe.Pointer(tp.typ.GCData))
+	var localgcdata [gcPtrbufSize / goarch.PtrBits]uintptr
+	if 2*elemsize < goarch.PtrSize*gcPtrbufSize {
+		nelem := min(n, goarch.PtrSize*gcPtrbufSize) / elemsize
+		limit := prepareGCDataForScanLarge(tp, nelem, &localgcdata)
+		ptrsize = limit - b
+		elemsize *= nelem
+		ptrcnt *= nelem
+		gcdata = &localgcdata[0]
+	}
+
+	delta := elemsize - alignUp(ptrsize, scan.ScanLargeGranularity)
+	for n >= scan.ScanLargeGranularity && n >= elemsize {
+		batchsize := elemsize * min(n/elemsize, gcPtrbufSize/ptrcnt)
+		if batchsize == 0 {
+			throw("Zero batch size")
+		}
+		limit := b + batchsize
+		scanned := scan.ScanObjectLarge(unsafe.Pointer(b), &gcw.ptrBuf[0], ptrsize, gcdata, delta, limit)
+		if scanned > 0 {
+			gcEnqueueBatch(gcw.ptrBuf[:scanned], s.base(), gcw)
+		}
+
+		n -= batchsize
+		b += batchsize
+	}
+
+	if n > 0 {
+		for {
+			var addr uintptr
+			if tp, addr = tp.nextFast(); addr == 0 {
+				if tp, addr = tp.next(b + n); addr == 0 {
+					break
+				}
+			}
+			// Work here is duplicated in scanblock and above.
+			// If you make changes here, make changes there too.
+			obj := *(*uintptr)(unsafe.Pointer(addr))
+
+			// At this point we have extracted the next potential pointer.
+			// Quickly filter out nil and pointers back to the current object.
+			if obj != 0 && obj-b >= n {
+				// Test if obj points into the Go heap and, if so,
+				// mark the object.
+				//
+				// Note that it's possible for findObject to
+				// fail if obj points to a just-allocated heap
+				// object because of a race with growing the
+				// heap. In this case, we know the object was
+				// just allocated and hence will be marked by
+				// allocation itself.
+				gcEnqueue(obj, b, addr, gcw)
+			}
+		}
+	}
+
+	return true
 }
 
 // obj is the start of an object with mark mbits.

@@ -16,7 +16,7 @@ type expandFunc func(sizeClass int, packed *gc.ObjMask, unpacked *gc.PtrMask)
 func testExpand(t *testing.T, expF expandFunc) {
 	expR := scan.ExpandReference
 
-	testObjs(t, func(t *testing.T, sizeClass int, objs *gc.ObjMask) {
+	testSmallObjs(t, func(t *testing.T, sizeClass int, objs *gc.ObjMask) {
 		var want, got gc.PtrMask
 		expR(sizeClass, objs, &want)
 		expF(sizeClass, objs, &got)

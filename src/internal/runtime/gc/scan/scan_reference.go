@@ -38,3 +38,25 @@ func ScanSpanPackedReference(mem unsafe.Pointer, bufp *uintptr, objMarks *gc.Obj
 	}
 	return count
 }
+
+// ScanObjectLargeReference is the reference implementation of ScanObjectLarge. It prioritizes clarity over performance.
+func ScanObjectLargeReference(mem unsafe.Pointer, bufp *uintptr, ptrsize uintptr, ptrmap *uintptr, elemdiff uintptr, limit uintptr) (count uintptr) {
+	buf := unsafe.Slice(bufp, gc.PageWords)
+	ptrMask := unsafe.Slice(ptrmap, ptrsize/goarch.PtrBits)
+	// Iterate over array of elements
+	for elem := 0; uintptr(unsafe.Add(mem, elem)) < limit; elem += int(ptrsize) + int(elemdiff) {
+		// Iterate over words in single element
+		for elemWord := 0; elemWord*goarch.PtrSize < int(ptrsize); elemWord++ {
+			if ptrMask[elemWord/goarch.PtrBits]&(1<<(elemWord%goarch.PtrBits)) == 0 {
+				continue
+			}
+			ptr := *(*uintptr)(unsafe.Add(mem, elem+elemWord*goarch.PtrSize))
+			if ptr == 0 {
+				continue
+			}
+			buf[count] = ptr
+			count++
+		}
+	}
+	return count
+}

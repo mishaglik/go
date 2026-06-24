@@ -23,6 +23,8 @@ const (
 	// Larger values reduce workbuf allocation overhead. Smaller
 	// values reduce heap fragmentation.
 	workbufAlloc = 32 << 10
+
+	gcPtrbufSize = pageSize / goarch.PtrSize
 )
 
 func init() {
@@ -109,7 +111,7 @@ type gcWork struct {
 	spanq spanQueue
 
 	// ptrBuf is a temporary buffer used by span scanning.
-	ptrBuf *[pageSize / goarch.PtrSize]uintptr
+	ptrBuf *[gcPtrbufSize]uintptr
 
 	// Bytes marked (blackened) on this gcWork. This is aggregated
 	// into work.bytesMarked by dispose.

@@ -134,6 +134,7 @@ import (
 	"internal/goexperiment"
 	"internal/runtime/atomic"
 	"internal/runtime/gc"
+	"internal/runtime/gc/scan"
 	"unsafe"
 )
 
@@ -809,8 +810,8 @@ func gcStart(trigger gcTrigger) {
 			throw("p mcache not flushed")
 		}
 		// Initialize ptrBuf if necessary.
-		if goexperiment.GreenTeaGC && p.gcw.ptrBuf == nil {
-			p.gcw.ptrBuf = (*[gc.PageSize / goarch.PtrSize]uintptr)(persistentalloc(gc.PageSize, goarch.PtrSize, &memstats.gcMiscSys))
+		if (goexperiment.GreenTeaGC || scan.HasFastScanObjectLarge()) && p.gcw.ptrBuf == nil {
+			p.gcw.ptrBuf = (*[gcPtrbufSize]uintptr)(persistentalloc(gc.PageSize, goarch.PtrSize, &memstats.gcMiscSys))
 		}
 	}
 

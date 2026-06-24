@@ -10,6 +10,7 @@ import (
 	"internal/goarch"
 	"internal/runtime/gc"
 	"internal/runtime/gc/scan"
+	"internal/runtime/sys"
 	"math/bits"
 	"math/rand/v2"
 	"slices"
@@ -18,9 +19,25 @@ import (
 	"unsafe"
 )
 
-type scanFunc func(mem unsafe.Pointer, bufp *uintptr, objMarks *gc.ObjMask, sizeClass uintptr, ptrMask *gc.PtrMask) (count int32)
+type scanSpanFunc func(mem unsafe.Pointer, bufp *uintptr, objMarks *gc.ObjMask, sizeClass uintptr, ptrMask *gc.PtrMask) (count int32)
+type scanObjLFunc func(mem unsafe.Pointer, bufp *uintptr, ptrsize uintptr, ptrmap *uintptr, elemdiff uintptr, limit uintptr) (count uintptr)
 
-func testScanSpanPacked(t *testing.T, scanF scanFunc) {
+func dumpSliceCmp(t *testing.T, name string, buf1, buf2 []uintptr) {
+	t.Logf("%s:", name)
+	for i := range max(len(buf1), len(buf2)) {
+		if i < len(buf1) && i < len(buf2) {
+			t.Logf("  [%03d]: %08x %08x", i, buf1[i], buf2[i])
+		} else {
+			if i >= len(buf1) {
+				t.Logf("  [%03d]: -------- %08x", i, buf2[i])
+			} else {
+				t.Logf("  [%03d]: %08x ---------", i, buf1[i])
+			}
+		}
+	}
+}
+
+func testScanSpanPacked(t *testing.T, scanF scanSpanFunc) {
 	scanR := scan.ScanSpanPackedReference
 
 	// Construct a fake memory
@@ -41,7 +58,7 @@ func testScanSpanPacked(t *testing.T, scanF scanFunc) {
 
 	bufF := make([]uintptr, gc.PageWords)
 	bufR := make([]uintptr, gc.PageWords)
-	testObjs(t, func(t *testing.T, sizeClass int, objs *gc.ObjMask) {
+	testSmallObjs(t, func(t *testing.T, sizeClass int, objs *gc.ObjMask) {
 		nF := scanF(unsafe.Pointer(&mem[0]), &bufF[0], objs, uintptr(sizeClass), &ptrs)
 		nR := scanR(unsafe.Pointer(&mem[0]), &bufR[0], objs, uintptr(sizeClass), &ptrs)
 
@@ -53,7 +70,82 @@ func testScanSpanPacked(t *testing.T, scanF scanFunc) {
 	})
 }
 
-func testObjs(t *testing.T, f func(t *testing.T, sizeClass int, objMask *gc.ObjMask)) {
+func testScanObjectLarge(t *testing.T, scanF scanObjLFunc) {
+	scanR := scan.ScanObjectLargeReference
+
+	// Construct a fake memory
+	mem, free := makeMem(t, gc.MaxSmallSize/gc.PageSize)
+	defer free()
+	for i := range mem {
+		// Use values > heap.PageSize because a scan function can discard
+		// pointers smaller than this.
+		mem[i] = uintptr(int(gc.PageSize) + i + 1)
+	}
+
+	bufF := make([]uintptr, gc.PageWords)
+	bufR := make([]uintptr, gc.PageWords)
+	testLargeObjs(t, func(t *testing.T, sizeClass int, elemsize uintptr) {
+		// Construct a random pointer mask
+		rnd := rand.New(rand.NewPCG(42, 42))
+		var ptrs gc.PtrMask
+		ptrsize := uintptr(0)
+		ptrcnt := 0
+		nelems := uintptr(gc.SizeClassToSize[sizeClass]) / elemsize
+		for i := range min((elemsize+goarch.PtrBits-1)/goarch.PtrBits, uintptr(len(ptrs))) {
+			ptrs[i] = uintptr(rnd.Uint64())
+			ptrcnt += sys.OnesCount64(uint64(ptrs[i]))
+			if nelems*uintptr(ptrcnt) > gc.PageWords {
+				for nelems*uintptr(ptrcnt) > gc.PageWords {
+					ptrs[i] &= ptrs[i] - 1
+					ptrcnt--
+				}
+				ptrsize = ((64 - uintptr(sys.LeadingZeros64(uint64(ptrs[i])))) + uintptr(i*64)) * goarch.PtrSize
+				break
+			}
+			ptrsize = ((64 - uintptr(sys.LeadingZeros64(uint64(ptrs[i])))) + uintptr(i*64)) * goarch.PtrSize
+		}
+		if elemsize%goarch.PtrBits != 0 && elemsize/goarch.PtrBits < uintptr(len(ptrs)) {
+			ptrs[elemsize/goarch.PtrBits] &= (uintptr(1) << (elemsize % goarch.PtrBits)) - 1
+			ptrsize = min(ptrsize, elemsize)
+		}
+
+		ptrsizeGranular := (ptrsize + scan.ScanLargeGranularity - 1) &^ (scan.ScanLargeGranularity - 1)
+		delta := elemsize - ptrsizeGranular
+		limit := uintptr(unsafe.Pointer(&mem[0])) + nelems*elemsize
+
+		nF := scanF(unsafe.Pointer(&mem[0]), &bufF[0], ptrsizeGranular, &ptrs[0], delta, limit)
+		nR := scanR(unsafe.Pointer(&mem[0]), &bufR[0], ptrsizeGranular, &ptrs[0], delta, limit)
+
+		if nR != nF {
+			dumpSliceCmp(t, "scanBuf want got", bufR[:nR], bufF[:nF])
+			t.Errorf("want %d count, got %d", nR, nF)
+		} else if !slices.Equal(bufF[:nF], bufR[:nR]) {
+			dumpSliceCmp(t, "scanBuf want got", bufR[:nR], bufF[:nF])
+			t.Errorf("want scanned pointers %d, got %d", bufR[:nR], bufF[:nF])
+		}
+	})
+}
+
+func testLargeObjs(t *testing.T, f func(t *testing.T, sizeClass int, elemsize uintptr)) {
+	for sizeClass := range gc.NumSizeClasses {
+		if sizeClass == 0 {
+			continue
+		}
+		size := uintptr(gc.SizeClassToSize[sizeClass])
+		if size < 1024 {
+			continue
+		}
+		t.Run(fmt.Sprintf("size=%d", size), func(t *testing.T) {
+			for elemsize := uintptr(goarch.PtrBits*goarch.PtrSize) / 2; elemsize <= size; elemsize += 8 {
+				t.Run(fmt.Sprintf("elemsize=%d", elemsize), func(t *testing.T) {
+					f(t, sizeClass, elemsize)
+				})
+			}
+		})
+	}
+}
+
+func testSmallObjs(t *testing.T, f func(t *testing.T, sizeClass int, objMask *gc.ObjMask)) {
 	for sizeClass := range gc.NumSizeClasses {
 		if sizeClass == 0 {
 			continue
@@ -85,6 +177,10 @@ var dataCacheSizes = sync.OnceValue(func() []uintptr {
 	return cs
 })
 
+func BenchmarkScanObjectLarge(b *testing.B) {
+	benchmarkScanObjectLargeAllSizeClasses(b)
+}
+
 func BenchmarkScanSpanPacked(b *testing.B) {
 	benchmarkCacheSizes(b, benchmarkScanSpanPackedAllSizeClasses)
 }
@@ -109,6 +205,21 @@ func benchmarkCacheSizes(b *testing.B, fn func(b *testing.B, heapPages int)) {
 	})
 }
 
+func benchmarkScanObjectLargeAllSizeClasses(b *testing.B) {
+	for sc := range gc.NumSizeClasses {
+		if sc == 0 {
+			continue
+		}
+		size := gc.SizeClassToSize[sc]
+		if size <= gc.MinSizeForMallocHeader {
+			continue
+		}
+		b.Run(fmt.Sprintf("sizeclass=%d", sc), func(b *testing.B) {
+			benchmarkScanLargeObject(b, sc)
+		})
+	}
+}
+
 func benchmarkScanSpanPackedAllSizeClasses(b *testing.B, nPages int) {
 	for sc := range gc.NumSizeClasses {
 		if sc == 0 {
@@ -122,6 +233,49 @@ func benchmarkScanSpanPackedAllSizeClasses(b *testing.B, nPages int) {
 			benchmarkScanSpanPacked(b, nPages, sc)
 		})
 	}
+}
+
+type typInfo struct {
+	size     uintptr
+	ptrbytes uintptr
+	gcdata   [gc.MaxSmallSize / goarch.PtrSize / goarch.PtrBits]uintptr
+}
+
+func makeObjectInfo(sizeClass int, n int) (infos []typInfo) {
+	rnd := rand.New(rand.NewPCG(42, 42))
+	infos = make([]typInfo, n)
+
+	// Threre is gcdata optimization that expands gcdata if it is too small.
+	// So limit element size from below.
+	const minElemWords = gc.PageSize / goarch.PtrSize / 2
+
+	// Scan buffer is limited to PageWords.
+	const maxPtrCount = gc.PageWords
+	for i := range n {
+		if gc.SizeClassToSize[sizeClass] < gc.PageSize/2 {
+			infos[i].size = uintptr(gc.SizeClassToSize[sizeClass])
+		} else {
+			infos[i].size = goarch.PtrSize * (minElemWords + uintptr(rnd.Uint64())%(uintptr(gc.SizeClassToSize[sizeClass])/goarch.PtrSize-minElemWords))
+		}
+		infos[i].ptrbytes = goarch.PtrSize * (8 + uintptr(rnd.Uint64())%uintptr((infos[i].size-8)/goarch.PtrSize))
+		gcdataWords := (infos[i].ptrbytes + goarch.PtrBits - 1) / goarch.PtrBits
+		ptrCount := 0
+		for j := range gcdataWords {
+			infos[i].gcdata[j] = uintptr(rnd.Uint64())
+			ptrCount += sys.OnesCount64(uint64(infos[i].gcdata[j]))
+			if ptrCount > maxPtrCount {
+				for ptrCount > maxPtrCount {
+					infos[i].gcdata[j] &= infos[i].gcdata[j] - 1
+					ptrCount--
+				}
+				break
+			}
+		}
+		if off := infos[i].ptrbytes % goarch.PtrBits; off != 0 {
+			infos[i].gcdata[gcdataWords-1] &= (uintptr(1) << off) - 1
+		}
+	}
+	return
 }
 
 func benchmarkScanSpanPacked(b *testing.B, nPages int, sizeClass int) {
@@ -202,6 +356,57 @@ func benchmarkScanSpanPacked(b *testing.B, nPages int, sizeClass int) {
 					for i := range b.N {
 						page := pageOrder[i%len(pageOrder)]
 						scan.ScanSpanPacked(unsafe.Pointer(&mem[gc.PageWords*page]), &buf[0], &objMarks, uintptr(sizeClass), &ptrs[page])
+					}
+				})
+			}
+		})
+	}
+}
+
+func benchmarkScanLargeObject(b *testing.B, sizeClass int) {
+	rnd := rand.New(rand.NewPCG(42, 42))
+
+	// Construct a fake memory
+	mem, free := makeMem(b, int(gc.SizeClassToNPages[sizeClass]))
+	defer free()
+	for i := range mem {
+		// Use values > heap.PageSize because a scan function can discard
+		// pointers smaller than this.
+		mem[i] = uintptr(int(gc.PageSize) + i + 1)
+	}
+
+	nObjects := int(gc.SizeClassToNPages[sizeClass]) * gc.PageSize / int(gc.SizeClassToSize[sizeClass])
+
+	// Construct a random object info
+	infos := makeObjectInfo(sizeClass, nObjects)
+
+	// Visit the objects in a random order
+	markOrder := rnd.Perm(nObjects)
+
+	// Create the scan buffer.
+	buf := make([]uintptr, gc.PageWords)
+
+	const steps = 11
+	for i := 0; i < steps; i++ {
+		frac := float64(i) / float64(steps-1)
+
+		b.Run(fmt.Sprintf("pct=%d", int(100*frac)), func(b *testing.B) {
+			b.Run("impl=Reference", func(b *testing.B) {
+				for i := range b.N {
+					obj := markOrder[i%len(markOrder)]
+					base := unsafe.Pointer(&mem[obj*int(gc.SizeClassToSize[sizeClass])/goarch.PtrSize])
+					limit := uintptr(base) + uintptr(gc.SizeClassToSize[sizeClass])/infos[obj].size*infos[obj].size
+					scan.ScanObjectLargeReference(base, &buf[0], infos[obj].ptrbytes, &infos[obj].gcdata[0], infos[obj].size-infos[obj].ptrbytes, limit)
+				}
+			})
+
+			if scan.HasFastScanObjectLarge() {
+				b.Run("impl=Platform", func(b *testing.B) {
+					for i := range b.N {
+						obj := markOrder[i%len(markOrder)]
+						base := unsafe.Pointer(&mem[obj*int(gc.SizeClassToSize[sizeClass])/goarch.PtrSize])
+						limit := uintptr(base) + uintptr(gc.SizeClassToSize[sizeClass])/infos[obj].size*infos[obj].size
+						scan.ScanObjectLarge(base, &buf[0], infos[obj].ptrbytes, &infos[obj].gcdata[0], infos[obj].size-infos[obj].ptrbytes, limit)
 					}
 				})
 			}
